@@ -8,6 +8,13 @@
       "patch_sha256": "cfab1bdc24a82e14bd69d794c43758a7662511c3636333b2f720e53afb927db3",
       "upstream_sha256": "fd08aae89dc14520501ffa231597a0e47dd959e3fa62d264d2dbfb8298bcaaa9",
       "patched_sha256": "2f41d53efdca0b5d7ffeb434e4b521be9ae49f674bf04de472416ba946e2c717"
+    },
+    {
+      "name": "dash-optional-representation-attributes.patch",
+      "target": "libavformat/dashdec.c",
+      "patch_sha256": "449c9a59fb0de5e5a4a3269a1884b40052d823817a412ed25ca20a0575b04a33",
+      "upstream_sha256": "288458b46446a793c55eb2e39e562cf2d6f84e6a24dd3e6f90799da261b46748",
+      "patched_sha256": "06d50a543ba85a859266b6db71c3089c51d9326c9a41d66746c67fa0ab695805"
     }
   ]
 }

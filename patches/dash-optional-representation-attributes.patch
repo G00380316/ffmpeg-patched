@@ -1,0 +1,234 @@
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -123,6 +123,12 @@
+     uint32_t init_sec_buf_read_offset;
+     int64_t cur_timestamp;
+     int is_restart_needed;
++    int ended;
++    /* A representation that is one whole file, sought while closed: where the
++     * seek wanted it, for recheck_discard_flags() to apply when it reopens. */
++    int has_pending_seek;
++    int64_t pending_seek_msec;
++    int pending_seek_flags;
+ };
+ 
+ typedef struct DASHContext {
+@@ -1115,19 +1121,17 @@
+     if (rep->fragment_duration > 0 && !rep->fragment_timescale)
+         rep->fragment_timescale = 1;
+     rep->bandwidth = rep_bandwidth_val ? atoi(rep_bandwidth_val) : 0;
++    /* On failure the end label frees both strings; freeing them here too
++     * freed them twice. */
+     if (rep_dependencyid_val) {
+         rep->dependencyid = av_strdup(rep_dependencyid_val);
+-        if (!rep->dependencyid) {
+-            xmlFree(rep_dependencyid_val);
++        if (!rep->dependencyid)
+             goto enomem;
+-        }
+     }
+     if (rep_codecs_val) {
+         rep->codecs = av_strdup(rep_codecs_val);
+-        if (!rep->codecs) {
+-            xmlFree(rep_codecs_val);
++        if (!rep->codecs)
+             goto enomem;
+-        }
+     }
+     rep->framerate = av_make_q(0, 0);
+     if (type == AVMEDIA_TYPE_VIDEO) {
+@@ -2289,10 +2293,12 @@
+             if (!ref->nb_assoc_stream)
+                 continue;
+             const AVDictionaryEntry *id = av_dict_get(ref->assoc_stream[0]->metadata, "id", NULL, AV_DICT_MATCH_CASE);
+-            if (!strcmp(rep->dependencyid, id->value))
++            /* A Representation need not have an id or codecs, and a manifest
++             * that leaves them out must not crash the reader. */
++            if (id && !strcmp(rep->dependencyid, id->value))
+                 break;
+         }
+-        if (j >= c->n_videos || !av_strstart(rep->codecs, "lvc1", NULL) ||
++        if (j >= c->n_videos || !rep->codecs || !av_strstart(rep->codecs, "lvc1", NULL) ||
+             rep->assoc_stream[0]->codecpar->codec_id != AV_CODEC_ID_LCEVC)
+             continue;
+         AVStreamGroup *stg = avformat_stream_group_create(s, AV_STREAM_GROUP_PARAMS_LCEVC, NULL);
+@@ -2311,6 +2317,16 @@
+     }
+ 
+     return 0;
++}
++
++/* Whether the caller wants any of a representation's streams. */
++static int representation_needed(const struct representation *pls)
++{
++    int needed = !pls->nb_assoc_stream;
++
++    for (int j = 0; j < pls->nb_assoc_stream; j++)
++        needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
++    return needed;
+ }
+ 
+ static void recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
+@@ -2319,12 +2335,10 @@
+ 
+     for (i = 0; i < n; i++) {
+         struct representation *pls = p[i];
+-        int needed = !pls->nb_assoc_stream;
++        int needed = representation_needed(pls);
+ 
+-        for (int j = 0; j < pls->nb_assoc_stream; j++)
+-            needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
+-
+         if (needed && !pls->ctx) {
++            pls->ended = 0;
+             pls->cur_seg_offset = 0;
+             pls->init_sec_buf_read_offset = 0;
+             /* Catch up */
+@@ -2332,6 +2346,16 @@
+                 pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
+             }
+             reopen_demux_for_component(s, pls);
++            /* Once reopened, a whole file sought while closed goes where the
++             * seek wanted it; a reopen that opened nothing keeps it, should
++             * another follow. */
++            if (pls->has_pending_seek && pls->ctx && pls->ctx->iformat) {
++                if (av_seek_frame(pls->ctx, -1, pls->pending_seek_msec * 1000,
++                                  pls->pending_seek_flags) < 0)
++                    av_log(s, AV_LOG_WARNING, "Could not seek stream_index %d where it was sought while closed\n",
++                           pls->stream_index);
++                pls->has_pending_seek = 0;
++            }
+             av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
+         } else if (!needed && pls->ctx) {
+             close_demux_for_component(pls);
+@@ -2355,7 +2379,7 @@
+ 
+     for (i = 0; i < c->n_videos; i++) {
+         rep = c->videos[i];
+-        if (!rep->ctx)
++        if (!rep->ctx || rep->ended)
+             continue;
+         if (!cur || rep->cur_timestamp < mints) {
+             cur = rep;
+@@ -2364,7 +2388,7 @@
+     }
+     for (i = 0; i < c->n_audios; i++) {
+         rep = c->audios[i];
+-        if (!rep->ctx)
++        if (!rep->ctx || rep->ended)
+             continue;
+         if (!cur || rep->cur_timestamp < mints) {
+             cur = rep;
+@@ -2374,7 +2398,7 @@
+ 
+     for (i = 0; i < c->n_subtitles; i++) {
+         rep = c->subtitles[i];
+-        if (!rep->ctx)
++        if (!rep->ctx || rep->ended)
+             continue;
+         if (!cur || rep->cur_timestamp < mints) {
+             cur = rep;
+@@ -2400,16 +2424,17 @@
+             ff_format_io_close(cur->parent, &cur->input);
+             ret = reopen_demux_for_component(s, cur);
+         } else if (ret == AVERROR_EOF) {
+-            close_demux_for_component(cur);
+-            ff_format_io_close(cur->parent, &cur->input);
++            /* Skip it while the others play on, until a seek moves it, and
++             * leave it open, as 8.1 did, so that the seek can: closed with
++             * its streams discarded, it stayed closed across a seek back. */
++            cur->ended = 1;
+             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
+-            // prevent recheck_discard_flags() from re-enabling the component
+-            for (int i = 0; i < cur->nb_assoc_stream; i++)
+-                cur->assoc_stream[i]->discard = AVDISCARD_ALL;
+             return FFERROR_REDO;
+         }
+     }
+-    return ret;
++    /* The loop ends without an error only when interrupted. Returning 0 there
++     * handed back no packet, and libavformat asked again at once, for ever. */
++    return ret < 0 ? ret : AVERROR_EXIT;
+ }
+ 
+ static int dash_close(AVFormatContext *s)
+@@ -2437,8 +2462,20 @@
+     if (pls->n_fragments == 1) {
+         pls->cur_timestamp = 0;
+         pls->cur_seg_offset = 0;
+-        if (dry_run)
++        if (dry_run) {
++            /* A closed whole file has no segment number to keep its place
++             * by, and would reopen at its first byte: remember the seek.
++             * Not one whose initialization stands apart: its reader cannot
++             * seek back, so a seek landing behind what the reopening read
++             * would end the input, where starting over only replays it. */
++            if (!pls->init_section) {
++                pls->has_pending_seek = 1;
++                pls->pending_seek_msec = seek_pos_msec;
++                pls->pending_seek_flags = flags;
++            }
+             return 0;
++        }
++        pls->has_pending_seek = 0;
+         ff_read_frame_flush(pls->ctx);
+         return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
+     }
+@@ -2487,6 +2524,24 @@
+     return ret;
+ }
+ 
++/* Moves one representation for a seek. It is no longer at its end. One the
++ * caller no longer wants is closed first, as recheck_discard_flags() would on
++ * the next read, so that the seek does not reopen it. A closed one keeps its
++ * place by segment number, or, if it is one whole file with no initialization
++ * apart, by the position the dry seek remembers, which
++ * recheck_discard_flags() applies when it reopens it. */
++static int seek_representation(AVFormatContext *s, struct representation *pls,
++                               int64_t seek_pos_msec, int flags)
++{
++    pls->ended = 0;
++    if (pls->ctx && !representation_needed(pls)) {
++        close_demux_for_component(pls);
++        ff_format_io_close(pls->parent, &pls->input);
++    }
++    /* Seek a closed one with dry_run=1 to avoid reopening it */
++    return dash_seek(s, pls, seek_pos_msec, flags, !pls->ctx);
++}
++
+ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
+ {
+     int ret = 0, i;
+@@ -2498,18 +2553,17 @@
+     if ((flags & AVSEEK_FLAG_BYTE) || c->is_live)
+         return AVERROR(ENOSYS);
+ 
+-    /* Seek in discarded streams with dry_run=1 to avoid reopening them */
+     for (i = 0; i < c->n_videos; i++) {
+         if (!ret)
+-            ret = dash_seek(s, c->videos[i], seek_pos_msec, flags, !c->videos[i]->ctx);
++            ret = seek_representation(s, c->videos[i], seek_pos_msec, flags);
+     }
+     for (i = 0; i < c->n_audios; i++) {
+         if (!ret)
+-            ret = dash_seek(s, c->audios[i], seek_pos_msec, flags, !c->audios[i]->ctx);
++            ret = seek_representation(s, c->audios[i], seek_pos_msec, flags);
+     }
+     for (i = 0; i < c->n_subtitles; i++) {
+         if (!ret)
+-            ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
++            ret = seek_representation(s, c->subtitles[i], seek_pos_msec, flags);
+     }
+ 
+     return ret;
+@@ -2559,7 +2613,9 @@
+     .p.name         = "dash",
+     .p.long_name    = NULL_IF_CONFIG_SMALL("Dynamic Adaptive Streaming over HTTP"),
+     .p.priv_class   = &dash_class,
+-    .p.flags        = AVFMT_NO_BYTE_SEEK,
++    /* No generic search, as for HLS: when its own seek fails, a search
++     * that reads the presentation forward can only fail after it. */
++    .p.flags        = AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK,
+     .priv_data_size = sizeof(DASHContext),
+     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+     .read_probe     = dash_probe,
