@@ -15,6 +15,13 @@
       "patch_sha256": "449c9a59fb0de5e5a4a3269a1884b40052d823817a412ed25ca20a0575b04a33",
       "upstream_sha256": "288458b46446a793c55eb2e39e562cf2d6f84e6a24dd3e6f90799da261b46748",
       "patched_sha256": "06d50a543ba85a859266b6db71c3089c51d9326c9a41d66746c67fa0ab695805"
+    },
+    {
+      "name": "http-chunked-end-of-body.patch",
+      "target": "libavformat/http.c",
+      "patch_sha256": "ebb8801ad9c130ec13bd05e248eddff5ca33a1306119273d4595cd73e464c551",
+      "upstream_sha256": "205a083b57dd105078e3f71a1d0fad1fb6342d023d9fae32a60cbf6227218e74",
+      "patched_sha256": "caff19ded3278e6ab338c966c5d0d969fd16159751fd8760a62f0609c42d4025"
     }
   ]
 }

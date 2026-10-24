@@ -1,0 +1,452 @@
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -158,6 +158,21 @@
+     int64_t sum_latency; /* divide by nb_requests */
+     int64_t max_latency;
+     int max_redirects;
++    /* The origin -- scheme, host and port -- that the headers, referer and
++     * cookies this context was given are for. */
++    char *credentials_origin;
++    /* Whether the request chain under way -- a request and the redirects it
++     * follows -- has reached another origin than that: then none of its
++     * requests carries them, back on their origin included. Exported, so
++     * that a caller can tell where such a chain ended. */
++    int left_credentials_origin;
++    /* Whether every request chain starts as one that has left: for a URL
++     * reached through another origin, which a caller opens anew. */
++    int credentials_withheld;
++    /* Whether the request under way went without the headers, referer and
++     * cookies, as one to another origin or of a chain that left theirs does:
++     * the cookies its response sets are marked so (COOKIE_WITHHELD). */
++    int request_withheld;
+ } HTTPContext;
+ 
+ #define OFFSET(x) offsetof(HTTPContext, x)
+@@ -206,6 +221,9 @@
+     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
+     { "short_seek_size", "Threshold to favor readahead over seek.", OFFSET(short_seek_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
+     { "max_redirects", "Maximum number of redirects", OFFSET(max_redirects), AV_OPT_TYPE_INT, { .i64 = MAX_REDIRECTS }, 0, INT_MAX, D },
++    { "credentials_origin", "origin the headers, referer and cookies were given for, by default the first URL's; elsewhere only the headers naming what the client accepts and its agent go, and only cookies set there", OFFSET(credentials_origin), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D },
++    { "credentials_withheld", "make every request as one whose redirects left credentials_origin: only the headers naming what the client accepts and its agent go, no referer, and of the cookies only those another origin set, to it, or set on responses to requests made so", OFFSET(credentials_withheld), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
++    { "left_credentials_origin", "export whether the last request's redirects left credentials_origin", OFFSET(left_credentials_origin), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+     { NULL }
+ };
+ 
+@@ -214,6 +232,9 @@
+                         const char *proxyauth);
+ static int http_read_header(URLContext *h);
+ static int http_shutdown(URLContext *h, int flags);
++static int http_url_origin(const char *url, char *origin, int origin_size);
++static int http_is_other_origin(HTTPContext *s, const char *url,
++                                char *origin, int origin_size);
+ 
+ void ff_http_init_auth_state(URLContext *dest, const URLContext *src)
+ {
+@@ -409,7 +430,9 @@
+     int reconnect_delay_total = 0;
+     uint64_t off;
+     char *cached;
++    char origin[1024];
+ 
++    s->left_credentials_origin = s->credentials_withheld;
+ redo:
+ 
+     cached = redirect_cache_get(s);
+@@ -417,6 +440,12 @@
+         if (redirects++ >= s->max_redirects)
+             return AVERROR(EIO);
+ 
++        /* A redirect taken from the cache makes no request of where it
++         * leads from, nor of where it leads to if that redirects in turn. */
++        if (http_is_other_origin(s, s->location, origin, sizeof(origin)) ||
++            http_is_other_origin(s, cached, origin, sizeof(origin)))
++            s->left_credentials_origin = 1;
++
+         av_free(s->location);
+         s->location = av_strdup(cached);
+         if (!s->location) {
+@@ -808,6 +837,17 @@
+ 
+     if (s->listen) {
+         return http_listen(h, uri, flags, options);
++    }
++    if (!s->credentials_origin || !s->credentials_origin[0]) {
++        char origin[1024];
++        if (http_url_origin(uri, origin, sizeof(origin)) >= 0) {
++            av_free(s->credentials_origin);
++            s->credentials_origin = av_strdup(origin);
++            if (!s->credentials_origin) {
++                ret = AVERROR(ENOMEM);
++                goto bail_out;
++            }
++        }
+     }
+     ret = http_open_cnx(h, options);
+ bail_out:
+@@ -1010,6 +1050,156 @@
+         date++;
+ 
+     return av_small_strptime(date, "%d%b%Y%H%M%S", buf) ? 0 : AVERROR(EINVAL);
++}
++
++/* The attribute the jar tags a cookie with: the origin of the response that
++ * set it, which is the only origin it goes back to. */
++#define COOKIE_ORIGIN "x-jar-origin"
++/* The attribute marking a cookie set on a response to a request that went
++ * without the credentials: such a cookie carries none of them, and goes back
++ * to its origin on a request that returns there from another, where the rest
++ * of its origin's cookies do not. */
++#define COOKIE_WITHHELD "x-jar-withheld"
++
++/* Whether an attribute or cookie name is one of the jar's own, which no
++ * server may set. */
++static int http_is_jar_attribute(const char *name, size_t length)
++{
++    return (length == strlen(COOKIE_ORIGIN) &&
++            !av_strncasecmp(name, COOKIE_ORIGIN, length)) ||
++           (length == strlen(COOKIE_WITHHELD) &&
++            !av_strncasecmp(name, COOKIE_WITHHELD, length));
++}
++
++/* The origin of an http(s) URL -- its scheme and host, lowercased, and its
++ * port, the scheme's default filled in -- as scheme://host:port. */
++static int http_url_origin(const char *url, char *origin, int origin_size)
++{
++    char proto[16], hostname[1024];
++    int port, i;
++
++    av_url_split(proto, sizeof(proto), NULL, 0, hostname, sizeof(hostname),
++                 &port, NULL, 0, url);
++    for (i = 0; proto[i]; i++)
++        proto[i] = av_tolower(proto[i]);
++    for (i = 0; hostname[i]; i++)
++        hostname[i] = av_tolower(hostname[i]);
++    if (!strcmp(proto, "http"))
++        port = port < 0 ? 80 : port;
++    else if (!strcmp(proto, "https"))
++        port = port < 0 ? 443 : port;
++    else
++        return AVERROR(EINVAL);
++    if (!hostname[0])
++        return AVERROR(EINVAL);
++    snprintf(origin, origin_size,
++             strchr(hostname, ':') ? "%s://[%s]:%d" : "%s://%s:%d",
++             proto, hostname, port);
++    return 0;
++}
++
++/* Whether `url` is on another origin than the one the context's headers,
++ * referer and cookies were given for. `origin` gets the URL's. */
++static int http_is_other_origin(HTTPContext *s, const char *url,
++                                char *origin, int origin_size)
++{
++    char given[1024];
++
++    if (http_url_origin(url, origin, origin_size) < 0)
++        origin[0] = '\0';
++    if (!s->credentials_origin || !s->credentials_origin[0])
++        return 0;
++    return !origin[0] ||
++           http_url_origin(s->credentials_origin, given, sizeof(given)) < 0 ||
++           strcmp(origin, given);
++}
++
++/* The lines of a header block that go to another origin: those naming what
++ * the client accepts, and its agent. A line ends at a CR, an LF or both, so
++ * that no line is carried along inside a kept one. */
++static char *http_cross_origin_headers(const char *headers)
++{
++    static const char *const kept[] = { "Accept", "Accept-Language",
++                                        "User-Agent", NULL };
++    AVBPrint lines;
++    char *result;
++
++    av_bprint_init(&lines, 0, AV_BPRINT_SIZE_UNLIMITED);
++    while (headers && *headers) {
++        size_t length = strcspn(headers, "\r\n");
++        const char *colon = memchr(headers, ':', length);
++        int i;
++
++        for (i = 0; colon && kept[i]; i++) {
++            if ((size_t)(colon - headers) == strlen(kept[i]) &&
++                !av_strncasecmp(headers, kept[i], colon - headers)) {
++                av_bprint_append_data(&lines, headers, (unsigned)length);
++                av_bprintf(&lines, "\r\n");
++                break;
++            }
++        }
++        headers += length;
++        headers += strspn(headers, "\r\n");
++    }
++    if (!av_bprint_is_complete(&lines) ||
++        av_bprint_finalize(&lines, &result) < 0) {
++        av_bprint_finalize(&lines, NULL);
++        return NULL;
++    }
++    return result;
++}
++
++/* A cookie a response set, as the jar keeps it: tagged with the origin of
++ * the request the response answered, and marked if that request went without
++ * the credentials, in place of any tag or mark the server sent. A cookie
++ * named like either is not kept. */
++static char *http_tagged_cookie(HTTPContext *s, const char *set_cookie)
++{
++    char origin[1024];
++    AVBPrint cookie;
++    const char *param = set_cookie;
++    char *result;
++    int first = 1;
++
++    if (http_url_origin(s->location, origin, sizeof(origin)) < 0)
++        return NULL;
++    av_bprint_init(&cookie, 0, AV_BPRINT_SIZE_UNLIMITED);
++    while (*param) {
++        size_t length = strcspn(param, ";");
++        const char *start = param + strspn(param, WHITESPACES);
++        const char *end = param + length;
++        size_t name_length;
++
++        while (end > start && strchr(WHITESPACES, end[-1]))
++            end--;
++        name_length = strcspn(start, "=;");
++        if (name_length > (size_t)(end - start))
++            name_length = end - start;
++        while (name_length && strchr(WHITESPACES, start[name_length - 1]))
++            name_length--;
++        if (http_is_jar_attribute(start, name_length)) {
++            if (first) {
++                av_bprint_finalize(&cookie, NULL);
++                return NULL;
++            }
++        } else if (end > start) {
++            av_bprintf(&cookie, "%s%.*s", first ? "" : "; ",
++                       (int)(end - start), start);
++        }
++        first = 0;
++        param += length;
++        if (*param == ';')
++            param++;
++    }
++    av_bprintf(&cookie, "; %s=%s", COOKIE_ORIGIN, origin);
++    if (s->request_withheld)
++        av_bprintf(&cookie, "; %s=1", COOKIE_WITHHELD);
++    if (!av_bprint_is_complete(&cookie) ||
++        av_bprint_finalize(&cookie, &result) < 0) {
++        av_bprint_finalize(&cookie, NULL);
++        return NULL;
++    }
++    return result;
+ }
+ 
+ static int parse_set_cookie(const char *set_cookie, AVDictionary **dict)
+@@ -1307,8 +1497,10 @@
+             av_free(s->mime_type);
+             s->mime_type = av_get_token((const char **)&p, ";");
+         } else if (!av_strcasecmp(tag, "Set-Cookie")) {
+-            if (parse_cookie(s, p, &s->cookie_dict))
++            char *cookie = http_tagged_cookie(s, p);
++            if (!cookie || parse_cookie(s, cookie, &s->cookie_dict))
+                 av_log(h, AV_LOG_WARNING, "Unable to parse '%s'\n", p);
++            av_free(cookie);
+         } else if (!av_strcasecmp(tag, "Icy-MetaInt")) {
+             s->icy_metaint = strtoull(p, NULL, 10);
+         } else if (!av_strncasecmp(tag, "Icy-", 4)) {
+@@ -1347,7 +1539,8 @@
+  * @return a negative value if an error condition occurred, 0 otherwise
+  */
+ static int get_cookies(HTTPContext *s, char **cookies, const char *path,
+-                       const char *domain)
++                       const char *domain, const char *origin,
++                       int cross_origin, int returned)
+ {
+     // cookie strings will look like Set-Cookie header field values.  Multiple
+     // Set-Cookie fields will result in multiple values delimited by a newline
+@@ -1381,9 +1574,23 @@
+ 
+         // if the cookie has no value, skip it
+         cookie_entry = av_dict_iterate(cookie_params, NULL);
+-        if (!cookie_entry || !cookie_entry->value)
++        if (!cookie_entry || !cookie_entry->value ||
++            !av_strcasecmp(cookie_entry->key, COOKIE_ORIGIN) ||
++            !av_strcasecmp(cookie_entry->key, COOKIE_WITHHELD))
+             goto skip_cookie;
+ 
++        // a cookie a response set goes back only to the origin that set it,
++        // and one the context was given only to the origin it was given for;
++        // neither, to that origin, once the request chain has left it, but
++        // for one set on a response to a request that went without them
++        if ((e = av_dict_get(cookie_params, COOKIE_ORIGIN, NULL, 0)) && e->value) {
++            if (strcmp(e->value, origin) ||
++                (returned && !av_dict_get(cookie_params, COOKIE_WITHHELD, NULL, 0)))
++                goto skip_cookie;
++        } else if (cross_origin) {
++            goto skip_cookie;
++        }
++
+         // if the cookie has expired, don't add it
+         if ((e = av_dict_get(cookie_params, "expires", NULL, 0)) && e->value) {
+             struct tm tm_buf = {0};
+@@ -1539,7 +1746,30 @@
+     const char *method;
+     int send_expect_100 = 0;
+     int keep_alive = 1;
++    /* A request to another origin than the headers, referer and cookies were
++     * given for -- after a redirect, or on a context a demuxer opened for a
++     * playlist's segment -- goes without them, and so does every request of
++     * its chain after it, back on their origin included: a host the chain
++     * reached could otherwise redirect it anywhere there to have them
++     * delivered. The origin's own cookies are withheld on such a return, but
++     * for those set on responses to requests made without them, and each other
++     * origin still gets the cookies it set. A context opened for where such a
++     * chain ended (credentials_withheld) makes every request so. */
++    char origin[1024];
++    int off_origin = http_is_other_origin(s, s->location, origin, sizeof(origin));
++    int cross_origin, returned;
++    char *cross_origin_headers;
++    const char *headers;
+ 
++    if (off_origin)
++        s->left_credentials_origin = 1;
++    cross_origin = s->left_credentials_origin;
++    returned = cross_origin && !off_origin;
++    s->request_withheld = cross_origin;
++    cross_origin_headers = cross_origin ? http_cross_origin_headers(s->headers) : NULL;
++    headers = cross_origin ? cross_origin_headers : s->headers;
++    if (cross_origin && s->headers && !cross_origin_headers)
++        return AVERROR(ENOMEM);
+     av_bprint_init_for_buffer(&request, s->buffer, sizeof(s->buffer));
+ 
+     /* send http header */
+@@ -1585,19 +1815,19 @@
+     if (post && s->chunked_post)
+         av_bprintf(&request, "Transfer-Encoding: chunked\r\n");
+     /* set default headers if needed */
+-    if (!has_header(s->headers, "\r\nUser-Agent: "))
++    if (!has_header(headers, "\r\nUser-Agent: "))
+         av_bprintf(&request, "User-Agent: %s\r\n", s->user_agent);
+-    if (s->referer) {
++    if (s->referer && !cross_origin) {
+         /* set default headers if needed */
+-        if (!has_header(s->headers, "\r\nReferer: "))
++        if (!has_header(headers, "\r\nReferer: "))
+             av_bprintf(&request, "Referer: %s\r\n", s->referer);
+     }
+-    if (!has_header(s->headers, "\r\nAccept: "))
++    if (!has_header(headers, "\r\nAccept: "))
+         av_bprintf(&request, "Accept: */*\r\n");
+     // Note: we send the Range header on purpose, even when we're probing,
+     // since it allows us to detect more reliably if a (non-conforming)
+     // server supports seeking by analysing the reply headers.
+-    if (!has_header(s->headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0)) {
++    if (!has_header(headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0)) {
+         av_bprintf(&request, "Range: bytes=%"PRIu64"-", s->off);
+         if ((s->initial_requests || s->request_size) && s->seekable != 0) {
+             uint64_t req_size = s->initial_requests ? s->initial_request_size : s->request_size;
+@@ -1612,34 +1842,39 @@
+             av_bprintf(&request, "%"PRId64, s->end_off - 1);
+         av_bprintf(&request, "\r\n");
+     }
+-    if (send_expect_100 && !has_header(s->headers, "\r\nExpect: "))
++    if (send_expect_100 && !has_header(headers, "\r\nExpect: "))
+         av_bprintf(&request, "Expect: 100-continue\r\n");
+ 
+-    if (!has_header(s->headers, "\r\nConnection: ")) {
++    if (!has_header(headers, "\r\nConnection: ")) {
+         keep_alive = s->multiple_requests;
+         av_bprintf(&request, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close");
+     }
+ 
+-    if (!has_header(s->headers, "\r\nHost: "))
++    if (!has_header(headers, "\r\nHost: "))
+         av_bprintf(&request, "Host: %s\r\n", hoststr);
+-    if (!has_header(s->headers, "\r\nContent-Length: ") && s->post_data)
++    if (!has_header(headers, "\r\nContent-Length: ") && s->post_data)
+         av_bprintf(&request, "Content-Length: %d\r\n", s->post_datalen);
+ 
+-    if (!has_header(s->headers, "\r\nContent-Type: ") && s->content_type)
++    if (!has_header(headers, "\r\nContent-Type: ") && s->content_type)
+         av_bprintf(&request, "Content-Type: %s\r\n", s->content_type);
+-    if (!has_header(s->headers, "\r\nCookie: ") && s->cookies) {
++    /* The jar is read whether a Cookie header is sent from it or not: what
++     * it read is what the response's cookies are added to, and the jar is
++     * then written back from that, so a request that skipped it left the
++     * jar holding the response's cookies alone. */
++    if (s->cookies) {
+         char *cookies = NULL;
+-        if (!get_cookies(s, &cookies, path, hoststr) && cookies) {
++        if (!get_cookies(s, &cookies, path, hoststr, origin, cross_origin,
++                         returned) &&
++            cookies && !has_header(headers, "\r\nCookie: "))
+             av_bprintf(&request, "Cookie: %s\r\n", cookies);
+-            av_free(cookies);
+-        }
++        av_free(cookies);
+     }
+-    if (!has_header(s->headers, "\r\nIcy-MetaData: ") && s->icy)
++    if (!has_header(headers, "\r\nIcy-MetaData: ") && s->icy)
+         av_bprintf(&request, "Icy-MetaData: 1\r\n");
+ 
+     /* now add in custom headers */
+-    if (s->headers)
+-        av_bprintf(&request, "%s", s->headers);
++    if (headers)
++        av_bprintf(&request, "%s", headers);
+ 
+     if (authstr)
+         av_bprintf(&request, "%s", authstr);
+@@ -1711,6 +1946,7 @@
+ done:
+     av_freep(&authstr);
+     av_freep(&proxyauthstr);
++    av_freep(&cross_origin_headers);
+     return err;
+ }
+ 
+@@ -1748,6 +1984,12 @@
+             }
+             else if (!s->chunksize) {
+                 av_log(h, AV_LOG_DEBUG, "Last chunk received, closing conn\n");
++                /* The body is complete. Unless Content-Range gave the size,
++                 * it is what was read: without it the next read took the
++                 * closed connection for a body cut short, and a whole chunked
++                 * response ended in an error. */
++                if (s->filesize == UINT64_MAX)
++                    s->filesize = s->off;
+                 ffurl_closep(&s->hd);
+                 return 0;
+             }
+@@ -2101,6 +2343,15 @@
+     HTTPContext *s = h->priv_data;
+     URLContext *old_hd = NULL;
+     uint64_t old_off = s->off;
++    /* What the old connection's response said of its body. A new request
++     * resets most of it, in http_connect() and the http_read_header() it
++     * calls, and its response's headers set it again, so a request that
++     * fails leaves it describing a refusal, or no response at all. */
++    uint64_t old_filesize = s->filesize, old_range_end = s->range_end;
++    uint64_t old_chunksize = s->chunksize;
++    uint64_t old_icy_data_read = s->icy_data_read;
++    uint64_t old_icy_metaint = s->icy_metaint;
++    int old_willclose = s->willclose, old_is_streamed = h->is_streamed;
+     uint8_t old_buf[BUFFER_SIZE];
+     int old_buf_size, ret;
+     AVDictionary *options = NULL;
+@@ -2191,6 +2442,17 @@
+             s->buf_end = s->buffer + old_buf_size;
+             s->hd      = old_hd;
+             s->off     = old_off;
++            /* and with what its response said of its body: a refusal that
++             * stated Content-Length: 0 left the size at 0, so the next read
++             * took a stream cut short, which a reconnect goes on with, for
++             * one that had ended, and ended it. */
++            s->filesize      = old_filesize;
++            s->range_end     = old_range_end;
++            s->chunksize     = old_chunksize;
++            s->willclose     = old_willclose;
++            s->icy_data_read = old_icy_data_read;
++            s->icy_metaint   = old_icy_metaint;
++            h->is_streamed   = old_is_streamed;
+         }
+         av_dict_free(&options);
+         return ret;
