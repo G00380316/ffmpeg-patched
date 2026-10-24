@@ -29,6 +29,13 @@
       "patch_sha256": "78f6b60b7dc86ea8aba703bafa5aba5adc3cb8ada771e0106bf0482d3f320b8f",
       "upstream_sha256": "0c88b1ca79de4501fade5864304443493fbbfa26cd21bf95013ee89f186bcfd8",
       "patched_sha256": "f1fb4d3b63d9539a3ce2ba7455d4fa2db35a0f5de0aee59f327da2f49ffbfbb3"
+    },
+    {
+      "name": "movenc-eac3-dependent-substreams.patch",
+      "target": "libavformat/movenc.c",
+      "patch_sha256": "e1fa01bccffac680f9d7a57d2853bc3a56007cfc9c271ec95b8e9318596d5978",
+      "upstream_sha256": "f4303c1c2313c590919ddcdcfac41ab1fc3d78c9a8a032462d6d83f6e767bea7",
+      "patched_sha256": "2f28843e1d10d76ff6586d92d1746ac27f3c05c059b78c8495786431b3a9c454"
     }
   ]
 }

@@ -1,0 +1,53 @@
+--- a/libavformat/movenc.c
++++ b/libavformat/movenc.c
+@@ -494,7 +494,10 @@
+     info->data_rate = FFMAX(info->data_rate, hdr->bit_rate / 1000);
+     info->ac3_bit_rate_code = FFMAX(info->ac3_bit_rate_code,
+                                     hdr->ac3_bit_rate_code);
+-    info->complexity_index_type_a = hdr->complexity_index_type_a;
++    /* Atmos may be signalled in a dependent substream alone, whose JOC
++     * complexity an independent frame without it must not clear. */
++    if (hdr->complexity_index_type_a)
++        info->complexity_index_type_a = hdr->complexity_index_type_a;
+ 
+     num_blocks = hdr->num_blocks;
+ 
+@@ -552,6 +555,7 @@
+         if (pkt->size != hdr->frame_size) {
+             int cumul_size = hdr->frame_size;
+             int parent = hdr->substreamid;
++            int total_rate = hdr->bit_rate / 1000;
+ 
+             while (cumul_size != pkt->size) {
+                 ret = avpriv_ac3_parse_header(&hdr, pkt->data + cumul_size, pkt->size - cumul_size);
+@@ -564,13 +568,25 @@
+                 info->substream[parent].num_dep_sub++;
+                 ret /= 8;
+ 
+-                /* get the dependent stream channel map, if exists */
+-                if (hdr->channel_map_present)
+-                    info->substream[parent].chan_loc |= (hdr->channel_map >> 5) & 0x1f;
+-                else
+-                    info->substream[parent].chan_loc |= hdr->channel_mode;
++                /* get the dependent stream channel map, if exists: chan_loc
++                 * bit k, counted from the least significant, is chanmap
++                 * location k + 5 for Lc/Rc (k = 0) through Cvh (k = 7), and
++                 * bit 8 is LFE2, chanmap location 14 (ETSI TS 102 366 F.6;
++                 * chanmap locations counted from its most significant bit).
++                 * A dependent substream without a chanmap adds none. */
++                if (hdr->channel_map_present) {
++                    for (int k = 0; k < 8; k++)
++                        info->substream[parent].chan_loc |=
++                            ((hdr->channel_map >> (10 - k)) & 1) << k;
++                    info->substream[parent].chan_loc |=
++                        ((hdr->channel_map >> 1) & 1) << 8;
++                }
++                if (hdr->complexity_index_type_a)
++                    info->complexity_index_type_a = hdr->complexity_index_type_a;
++                total_rate += hdr->bit_rate / 1000;
+                 cumul_size += hdr->frame_size;
+             }
++            info->data_rate = FFMAX(info->data_rate, total_rate);
+         }
+     }
+ 
