@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source": "ffmpeg-9.0.2.tar.xz",
+  "patches": [
+    {
+      "name": "hls-retain-initialization.patch",
+      "target": "libavformat/hls.c",
+      "patch_sha256": "cfab1bdc24a82e14bd69d794c43758a7662511c3636333b2f720e53afb927db3",
+      "upstream_sha256": "fd08aae89dc14520501ffa231597a0e47dd959e3fa62d264d2dbfb8298bcaaa9",
+      "patched_sha256": "2f41d53efdca0b5d7ffeb434e4b521be9ae49f674bf04de472416ba946e2c717"
+    }
+  ]
+}

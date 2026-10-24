@@ -1,0 +1,253 @@
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -339,11 +339,9 @@
+     if (!abs_url[0])
+         return NULL;
+ 
+-    for (int i = 0; i < c->n_playlists; i++) {
+-        if (!strcmp(c->playlists[i]->url, abs_url))
+-            return c->playlists[i];
+-    }
+-
++    /* Each reference gets its own playlist, as in 8.1. One shared by two
++     * variants puts its streams in both programs, and a player's variant
++     * selection refuses a stream it cannot give to one variant. */
+     pls = av_mallocz(sizeof(struct playlist));
+     if (!pls)
+         return NULL;
+@@ -488,11 +486,54 @@
+         sec->size = -1;
+     }
+ 
+-    dynarray_add(&pls->init_sections, &pls->n_init_sections, sec);
++    return sec;
++}
+ 
++/* Keep the effective map identity stable across live playlist reloads. The
++ * input retains the current initialization bytes, so a fresh allocation for
++ * an unchanged MAP would unnecessarily fetch and inject them again. */
++static struct segment *retain_init_section(struct playlist *pls,
++                                          struct segment *sec)
++{
++    int i;
++    for (i = 0; i < pls->n_init_sections; i++) {
++        struct segment *existing = pls->init_sections[i];
++        if (existing->size != sec->size || existing->url_offset != sec->url_offset ||
++            existing->key_type != sec->key_type || strcmp(existing->url, sec->url))
++            continue;
++        if (sec->key_type != KEY_NONE &&
++            (strcmp(existing->key, sec->key) || memcmp(existing->iv, sec->iv, sizeof(sec->iv))))
++            continue;
++        av_freep(&sec->key);
++        av_freep(&sec->url);
++        av_free(sec);
++        return existing;
++    }
++    dynarray_add(&pls->init_sections, &pls->n_init_sections, sec);
+     return sec;
+ }
+ 
++/* Retain only the current reader's map and maps still referenced by the live
++ * window. Rotating map URIs must not grow this list for the entire session. */
++static void prune_init_sections(struct playlist *pls)
++{
++    int i, j, kept = 0;
++    for (i = 0; i < pls->n_init_sections; i++) {
++        struct segment *sec = pls->init_sections[i];
++        int referenced = sec == pls->cur_init_section;
++        for (j = 0; !referenced && j < pls->n_segments; j++)
++            referenced = pls->segments[j]->init_section == sec;
++        if (referenced) {
++            pls->init_sections[kept++] = sec;
++        } else {
++            av_freep(&sec->key);
++            av_freep(&sec->url);
++            av_free(sec);
++        }
++    }
++    pls->n_init_sections = kept;
++}
++
+ static void handle_init_section_args(void *context, const char *key,
+                                      int key_len, char **dest, int *dest_len)
+ {
+@@ -977,12 +1018,14 @@
+             if (key_type != KEY_NONE) {
+                 ff_make_absolute_url(tmp_str, sizeof(tmp_str), url, key);
+                 if (!tmp_str[0]) {
++                    av_freep(&cur_init_section->url);
+                     av_free(cur_init_section);
+                     ret = AVERROR_INVALIDDATA;
+                     goto fail;
+                 }
+                 cur_init_section->key = av_strdup(tmp_str);
+                 if (!cur_init_section->key) {
++                    av_freep(&cur_init_section->url);
+                     av_free(cur_init_section);
+                     ret = AVERROR(ENOMEM);
+                     goto fail;
+@@ -990,6 +1033,7 @@
+             } else {
+                 cur_init_section->key = NULL;
+             }
++            cur_init_section = retain_init_section(pls, cur_init_section);
+ 
+         } else if (av_strstart(line, "#EXT-X-START:", &ptr)) {
+             const char *time_offset_value = NULL;
+@@ -1145,8 +1189,10 @@
+         free_segment_dynarray(prev_segments, prev_n_segments);
+         av_freep(&prev_segments);
+     }
+-    if (pls)
++    if (pls) {
++        prune_init_sections(pls);
+         pls->last_load_time = av_gettime_relative();
++    }
+ 
+ fail:
+     av_free(new_url);
+@@ -1158,15 +1204,8 @@
+           c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+ 
+-    if (c->n_variants && c->variants[0]->n_playlists &&
+-        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT &&
+-        !c->variants[0]->playlists[0]->finished) {
+-        struct playlist *p = c->variants[0]->playlists[0];
+-        int64_t duration = 0;
+-        for (int i = 0; i < p->n_segments; i++)
+-            duration += p->segments[i]->duration;
+-        c->ctx->duration = duration;
+-    }
++    /* An EVENT playlist that has not ended keeps an unset duration; see
++     * hls_read_header. */
+ 
+     return ret;
+ }
+@@ -1193,13 +1232,14 @@
+ static int segment_reusable(AVIOContext *in, const struct segment *cur,
+                             const struct segment *next)
+ {
+-    return in && cur && next &&
+-           (in->seekable & AVIO_SEEKABLE_NORMAL) &&
+-           cur->size >= 0 && next->size >= 0 &&
+-           next->url_offset == cur->url_offset + cur->size &&
+-           cur->key_type == KEY_NONE && next->key_type == KEY_NONE &&
+-           next->init_section == cur->init_section &&
+-           !strcmp(next->url, cur->url);
++    /* Every segment is read through its own input, as in 8.1. With the range
++     * limited to its segment below, an input kept for the next one ends where
++     * the first did, and the next was skipped: a byte-range playlist read
++     * through FFmpeg's own HTTP lost every other segment. */
++    (void)in;
++    (void)cur;
++    (void)next;
++    return 0;
+ }
+ 
+ static int read_from_url(struct playlist *pls, struct segment *seg,
+@@ -1479,25 +1519,12 @@
+         av_dict_set(&opts, "multiple_requests", "1", 0);
+ 
+     if (seg->size >= 0) {
+-        /* Restrict the request to the wanted byte range. The end is extended
+-         * across following contiguous segments of the same resource so one
+-         * connection serves the whole run. */
+-        int64_t end_offset = seg->url_offset + seg->size;
+-        if (seg == current_segment(pls)) {
+-            int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
+-            while (n < pls->n_segments) {
+-                struct segment *ns = pls->segments[n];
+-                if (ns->size < 0 || ns->url_offset != end_offset ||
+-                    ns->key_type != KEY_NONE ||
+-                    ns->init_section != seg->init_section ||
+-                    strcmp(ns->url, seg->url))
+-                    break;
+-                end_offset = ns->url_offset + ns->size;
+-                n++;
+-            }
+-        }
++        /* Request exactly this segment's range, as 8.1 did. FFmpeg 9 widened
++         * it across the following contiguous segments to read the run through
++         * one input, but a reader of pipes cannot seek into the next
++         * segment, so every segment asked for the rest of the run again. */
+         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
+-        av_dict_set_int(&opts, "end_offset", end_offset, 0);
++        av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+     }
+ 
+     av_log(pls->parent, AV_LOG_VERBOSE, "HLS request for url '%s', offset %"PRId64", playlist %d\n",
+@@ -2327,10 +2354,10 @@
+         }
+     }
+ 
+-    /* Calculate the total duration of the stream if all segments are
+-     * available (finished or EVENT playlists). */
+-    if (c->variants[0]->playlists[0]->finished ||
+-        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT) {
++    /* Calculate the total duration of the stream once the playlist has
++     * ended. An EVENT playlist is still growing until then, and a player
++     * reads a duration on a source it cannot seek as a finished one. */
++    if (c->variants[0]->playlists[0]->finished) {
+         int64_t duration = 0;
+         for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
+             duration += c->variants[0]->playlists[0]->segments[i]->duration;
+@@ -2731,17 +2758,13 @@
+                             for (int64_t k = 0; k < seg_idx && k < pls->n_segments; k++)
+                                 ts -= pls->segments[k]->duration;
+ 
++                        /* No stream start time is taken from it: FFmpeg 9 gave
++                         * an EVENT playlist's streams its first decode time,
++                         * where the same media as video on demand starts each
++                         * at its own first picture. */
+                         if (c->first_timestamp == AV_NOPTS_VALUE) {
+                             c->first_timestamp = ts;
+                             c->first_timestamp_pls = pls;
+-
+-                            if (pls->type == PLS_TYPE_EVENT)
+-                                for (unsigned k = 0; k < s->nb_streams; k++) {
+-                                    AVStream *st = s->streams[k];
+-                                    if (st->start_time == AV_NOPTS_VALUE)
+-                                        st->start_time = av_rescale_q(ts,
+-                                            AV_TIME_BASE_Q, st->time_base);
+-                                }
+                         }
+                         pls->ts_offset = ts - c->first_timestamp;
+                     }
+@@ -2767,9 +2790,10 @@
+                     }
+ 
+                     tb = get_timebase(pls);
+-                    ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
+-                                            tb.den, AV_ROUND_DOWN) -
+-                            pls->seek_timestamp;
++                    /* Match first_timestamp and segment seek boundaries;
++                     * downward rounding can discard their first keyframe. */
++                    ts_diff = av_rescale_q(pls->pkt->dts, tb, AV_TIME_BASE_Q) -
++                              pls->seek_timestamp;
+                     if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
+                                         pls->pkt->flags & AV_PKT_FLAG_KEY)) {
+                         pls->seek_timestamp = AV_NOPTS_VALUE;
+@@ -2891,9 +2915,9 @@
+     first_timestamp = c->first_timestamp == AV_NOPTS_VALUE ?
+                       0 : c->first_timestamp;
+ 
+-    seek_timestamp = av_rescale_rnd(timestamp, AV_TIME_BASE,
+-                                    s->streams[stream_index]->time_base.den,
+-                                    AV_ROUND_DOWN);
++    seek_timestamp = av_rescale_q(timestamp,
++                                  s->streams[stream_index]->time_base,
++                                  AV_TIME_BASE_Q);
+ 
+     duration = s->duration == AV_NOPTS_VALUE ?
+                0 : s->duration;
+@@ -3028,6 +3052,9 @@
+ #define OFFSET(x) offsetof(HLSContext, x)
+ #define FLAGS AV_OPT_FLAG_DECODING_PARAM
+ static const AVOption hls_options[] = {
++    {"first_demux_timestamp", "first demux timestamp in microseconds",
++        OFFSET(first_timestamp), AV_OPT_TYPE_INT64, {.i64 = AV_NOPTS_VALUE},
++        INT64_MIN, INT64_MAX, AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY},
+     {"live_start_index", "segment index to start live streams at (negative values are from the end)",
+         OFFSET(live_start_index), AV_OPT_TYPE_INT, {.i64 = -3}, INT_MIN, INT_MAX, FLAGS},
+     {"prefer_x_start", "prefer to use #EXT-X-START if it's in playlist instead of live_start_index",
