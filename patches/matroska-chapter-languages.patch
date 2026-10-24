@@ -1,0 +1,85 @@
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -308,11 +308,22 @@
+     AVStream *stream;
+ } MatroskaAttachment;
+ 
++/* ChapLanguageBCP47, which matroska.h does not name. */
++#define MATROSKA_ID_CHAPLANG_BCP47 0x437D
++
++/* One name of a chapter, in one language: a chapter has one per language
++ * it is named in. */
++typedef struct MatroskaChapterDisplay {
++    char *string;
++    char *lang;
++    char *lang_bcp47;
++} MatroskaChapterDisplay;
++
+ typedef struct MatroskaChapter {
+     uint64_t start;
+     uint64_t end;
+     uint64_t uid;
+-    char    *title;
++    EbmlList display;
+ 
+     AVChapter *chapter;
+ } MatroskaChapter;
+@@ -663,9 +674,10 @@
+ };
+ 
+ static EbmlSyntax matroska_chapter_display[] = {
+-    { MATROSKA_ID_CHAPSTRING,  EBML_UTF8, 0, 0, offsetof(MatroskaChapter, title) },
+-    { MATROSKA_ID_CHAPLANG,    EBML_NONE },
+-    { MATROSKA_ID_CHAPCOUNTRY, EBML_NONE },
++    { MATROSKA_ID_CHAPSTRING,       EBML_UTF8, 0, 0, offsetof(MatroskaChapterDisplay, string) },
++    { MATROSKA_ID_CHAPLANG,         EBML_STR,  0, 0, offsetof(MatroskaChapterDisplay, lang), { .s = "eng" } },
++    { MATROSKA_ID_CHAPLANG_BCP47,   EBML_STR,  0, 0, offsetof(MatroskaChapterDisplay, lang_bcp47) },
++    { MATROSKA_ID_CHAPCOUNTRY,      EBML_NONE },
+     CHILD_OF(matroska_chapter_entry)
+ };
+ 
+@@ -673,7 +685,7 @@
+     { MATROSKA_ID_CHAPTERTIMESTART,   EBML_UINT, 0, 0, offsetof(MatroskaChapter, start), { .u = AV_NOPTS_VALUE } },
+     { MATROSKA_ID_CHAPTERTIMEEND,     EBML_UINT, 0, 0, offsetof(MatroskaChapter, end),   { .u = AV_NOPTS_VALUE } },
+     { MATROSKA_ID_CHAPTERUID,         EBML_UINT, 0, 0, offsetof(MatroskaChapter, uid) },
+-    { MATROSKA_ID_CHAPTERDISPLAY,     EBML_NEST, 0, 0,                        0,         { .n = matroska_chapter_display } },
++    { MATROSKA_ID_CHAPTERDISPLAY,     EBML_NEST, 0, sizeof(MatroskaChapterDisplay), offsetof(MatroskaChapter, display), { .n = matroska_chapter_display } },
+     { MATROSKA_ID_CHAPTERFLAGHIDDEN,  EBML_NONE },
+     { MATROSKA_ID_CHAPTERFLAGENABLED, EBML_NONE },
+     { MATROSKA_ID_CHAPTERPHYSEQUIV,   EBML_NONE },
+@@ -3554,11 +3566,34 @@
+     for (i = 0; i < chapters_list->nb_elem; i++)
+         if (chapters[i].start != AV_NOPTS_VALUE && chapters[i].uid &&
+             (max_start == 0 || chapters[i].start > max_start)) {
++            MatroskaChapterDisplay *display = chapters[i].display.elem;
++            const char *title = NULL;
++            /* The title is the last name, as when each name overwrote the
++             * one before; each name is also kept by its language, as
++             * "title-<language>", as tags in a language are. */
++            for (j = 0; j < chapters[i].display.nb_elem; j++)
++                if (display[j].string)
++                    title = display[j].string;
+             chapters[i].chapter =
+                 avpriv_new_chapter(s, chapters[i].uid,
+                                    (AVRational) { 1, 1000000000 },
+                                    chapters[i].start, chapters[i].end,
+-                                   chapters[i].title);
++                                   title);
++            if (chapters[i].chapter) {
++                for (j = 0; j < chapters[i].display.nb_elem; j++) {
++                    const char *lang = display[j].lang_bcp47 && *display[j].lang_bcp47
++                                       ? display[j].lang_bcp47 : display[j].lang;
++                    char key[64];
++                    int written;
++                    if (!display[j].string || !lang || !*lang || !strcmp(lang, "und"))
++                        continue;
++                    written = snprintf(key, sizeof(key), "title-%s", lang);
++                    if (written < 0 || written >= (int)sizeof(key))
++                        continue;
++                    av_dict_set(&chapters[i].chapter->metadata, key, display[j].string,
++                                AV_DICT_DONT_OVERWRITE);
++                }
++            }
+             max_start = chapters[i].start;
+         }
+ 

@@ -22,6 +22,13 @@
       "patch_sha256": "ebb8801ad9c130ec13bd05e248eddff5ca33a1306119273d4595cd73e464c551",
       "upstream_sha256": "205a083b57dd105078e3f71a1d0fad1fb6342d023d9fae32a60cbf6227218e74",
       "patched_sha256": "caff19ded3278e6ab338c966c5d0d969fd16159751fd8760a62f0609c42d4025"
+    },
+    {
+      "name": "matroska-chapter-languages.patch",
+      "target": "libavformat/matroskadec.c",
+      "patch_sha256": "78f6b60b7dc86ea8aba703bafa5aba5adc3cb8ada771e0106bf0482d3f320b8f",
+      "upstream_sha256": "0c88b1ca79de4501fade5864304443493fbbfa26cd21bf95013ee89f186bcfd8",
+      "patched_sha256": "f1fb4d3b63d9539a3ce2ba7455d4fa2db35a0f5de0aee59f327da2f49ffbfbb3"
     }
   ]
 }
