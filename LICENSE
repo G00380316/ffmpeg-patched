@@ -1,0 +1,22 @@
+This repository holds the source of two libraries and the scripts to build
+them. Each library keeps its own licence.
+
+FFmpeg 9.0.2, in ffmpeg/, with the changes in patches/ (which are under the
+same licence as the files they change), is licensed under the GNU Lesser
+General Public License version 2.1 or later. See:
+
+    ffmpeg/COPYING.LGPLv2.1   the licence text
+    ffmpeg/LICENSE.md         FFmpeg's statement of how its parts are licensed
+
+The configuration the scripts build disables FFmpeg's GPL, nonfree and
+version 3 components.
+
+dav1d 1.5.4, which build-ffmpeg.sh fetches and links into the FFmpeg
+framework, is licensed under the BSD 2-Clause licence:
+
+    licenses/dav1d-COPYING
+
+GNU FriBidi 1.0.16, which build-fribidi.sh fetches and builds unmodified, is
+licensed under the GNU Lesser General Public License version 2.1 or later:
+
+    licenses/fribidi-COPYING
