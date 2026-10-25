@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 G00380316
 #
 # Builds GPlayerFriBidiBinary.xcframework from GNU FriBidi 1.0.16, unmodified:
 # one dynamic GPlayerFriBidiBinary.framework per platform variant,

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 G00380316
 #
 # Builds GPlayerFFmpegBinary.xcframework from the patched FFmpeg 9.0.2 in
 # ffmpeg/ and dav1d 1.5.4: one dynamic GPlayerFFmpegBinary.framework per

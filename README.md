@@ -200,5 +200,8 @@ copy, as described here.
   `licenses/dav1d-COPYING`.
 - GNU FriBidi is licensed under the GNU Lesser General Public License version
   2.1 or later: `licenses/fribidi-COPYING`.
+- The build scripts and this README are under the MIT License. It covers
+  only those files: using, changing or distributing FFmpeg, its patches or
+  FriBidi is governed by their own licences above.
 
 See `LICENSE`.
